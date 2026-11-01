@@ -1,6 +1,8 @@
 # An MP3 Player Designed by My Daughter
 
-<img src="./images/002.png" />
+<a href="https://youtu.be/aMDl66ehtE4"><img src="./images/011.png" /></a>
+
+[Watch the video on YouTube](https://youtu.be/aMDl66ehtE4)
 
 My daughter came up with this design at school and insisted that I bring it to life. And when I say insisted, I mean she directly supervised and micromanaged me throughout the entire build, to make sure I followed her very specific vision.
 
