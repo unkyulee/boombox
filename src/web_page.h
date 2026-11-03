@@ -336,16 +336,17 @@ function enqueue(list) {
   if (!uploading) next();
 }
 
-// Files go up in chunks: the player drops an upload after a second without data, so a big file
-// in one piece rarely survives Wi-Fi. A dropped chunk costs a retry, not the whole file.
-const CHUNK = 1024 * 1024;
+// Files go up in chunks, so a dropped connection costs a retry, not the whole file. They go as
+// plain bodies to the player's upload server on its own port (UPLOAD_PORT in config.h), which
+// takes them far faster than the form parser behind /api/fs/upload.
+const UPLOAD_URL = `${location.protocol}//${location.hostname}:81/upload?`;
+const CHUNK = 4 * 1024 * 1024;
 const RETRIES = 6;
 
 function sendChunk(job, offset) {
   const end = Math.min(offset + CHUNK, job.file.size);
   return new Promise(resolve => {
-    const xhr = new XMLHttpRequest(), form = new FormData();
-    form.append('file', job.file.slice(offset, end), job.file.name);
+    const xhr = new XMLHttpRequest();
     xhr.upload.onprogress = e => {
       if (job.file.size) job.st.textContent = Math.floor(100 * (offset + e.loaded) / job.file.size) + '%';
     };
@@ -356,8 +357,8 @@ function sendChunk(job, offset) {
     };
     xhr.onerror = xhr.ontimeout = () => resolve({status: 0, j: {error: 'network error'}, end});
     xhr.timeout = 180000;
-    xhr.open('POST', '/api/fs/upload?' + new URLSearchParams({path: job.dir, offset, total: job.file.size}));
-    xhr.send(form);
+    xhr.open('POST', UPLOAD_URL + new URLSearchParams({path: job.dir, name: job.file.name, offset, total: job.file.size}));
+    xhr.send(job.file.slice(offset, end));
   });
 }
 

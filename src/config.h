@@ -56,3 +56,4 @@
 #define AP_SSID         "MP3-Player"
 #define AP_PASS         "mp3player"   // at least 8 characters
 #define HOSTNAME        "mp3player"   // http://mp3player.local
+#define UPLOAD_PORT     81            // fast uploads from the web page; also set in web_page.h

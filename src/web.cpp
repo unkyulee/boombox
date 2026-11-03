@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiMulti.h>
+#include <lwip/sockets.h>
 
 #include "config.h"
 #include "player.h"
@@ -271,11 +272,14 @@ void handleRename() {
 //
 // WebServer drops an upload when the data pauses for more than a second, which over Wi-Fi is
 // all but certain somewhere in a large file. So the page sends a file as a series of chunks,
-// each its own multipart POST, and a dropped chunk is simply sent again. Query parameters:
+// each its own POST, and a dropped chunk is simply sent again. Query parameters:
 //   path    the folder                     offset  where this chunk starts in the file
 //   total   size of the whole file
 // Without offset and total the upload is the whole file, which suits curl -F.
 // The file grows as "<name>.part" and takes its real name when the last chunk lands.
+//
+// The page sends its chunks to the fast upload server below; /api/fs/upload takes the same
+// chunks as multipart forms, for curl.
 
 struct Upload {
   File file;
@@ -283,98 +287,245 @@ struct Upload {
   int code = 200;
   uint32_t offset = 0, total = 0, received = 0;
   int32_t have = -1;  // on an out-of-step chunk, how much of the file the card already holds
-} upload;
+};
 
-void uploadFail(int code, const String &msg) {
-  if (upload.file) upload.file.close();
-  if (!upload.error.length()) {
-    upload.code = code;
-    upload.error = msg;
-    Serial.printf("[web] upload %s: %s\n", upload.target.c_str(), msg.c_str());
+void uploadFail(Upload &u, int code, const String &msg) {
+  if (u.file) u.file.close();
+  if (!u.error.length()) {
+    u.code = code;
+    u.error = msg;
+    Serial.printf("[web] upload %s: %s\n", u.target.c_str(), msg.c_str());
   }
 }
 
-void uploadStart() {
-  upload.error = "";
-  upload.code = 200;
-  upload.received = 0;
-  upload.have = -1;
+void uploadStart(Upload &u, const String &dirArg, const String &nameArg, uint32_t offset, uint32_t total) {
+  u.error = "";
+  u.code = 200;
+  u.received = 0;
+  u.have = -1;
+  u.offset = offset;
+  u.total = total;
 
-  String dir = storage::cleanPath(server.arg("path"));
-  String name = cleanName(server.upload().filename);
-  upload.target = storage::join(dir, name);
-  upload.part = upload.target + ".part";
-  if (!dir.length() || !name.length()) return uploadFail(400, "bad path");
-  if (!storage::isDir(dir)) return uploadFail(404, "no such folder");
+  String dir = storage::cleanPath(dirArg);
+  String name = cleanName(nameArg);
+  u.target = storage::join(dir, name);
+  u.part = u.target + ".part";
+  if (!dir.length() || !name.length()) return uploadFail(u, 400, "bad path");
+  if (!storage::isDir(dir)) return uploadFail(u, 404, "no such folder");
 
-  // Without `total`, the request size is a close enough upper bound for the space check.
-  upload.offset = strtoul(server.arg("offset").c_str(), nullptr, 10);
-  upload.total = server.hasArg("total") ? strtoul(server.arg("total").c_str(), nullptr, 10)
-                                        : upload.offset + server.clientContentLength();
-
-  if (upload.offset == 0) {
+  if (u.offset == 0) {
     uint64_t free = storage::totalBytes() - storage::usedBytes();
-    if (upload.total > free) {
-      return uploadFail(507, "not enough space on the card (" + String((uint32_t)(free >> 20)) + " MB free)");
+    if (u.total > free) {
+      return uploadFail(u, 507, "not enough space on the card (" + String((uint32_t)(free >> 20)) + " MB free)");
     }
-    if (SD.exists(upload.part)) SD.remove(upload.part);
-    upload.file = SD.open(upload.part, FILE_WRITE);
+    if (SD.exists(u.part)) SD.remove(u.part);
+    u.file = SD.open(u.part, FILE_WRITE);
   } else {
     // A later chunk. A retried chunk may have partly landed already, so write from its offset.
-    File f = SD.open(upload.part);
-    upload.have = f ? (int32_t)f.size() : 0;
+    File f = SD.open(u.part);
+    u.have = f ? (int32_t)f.size() : 0;
     if (f) f.close();
-    if ((uint32_t)upload.have < upload.offset) return uploadFail(409, "out of step with the card");
-    upload.file = SD.open(upload.part, "r+");
-    if (upload.file && !upload.file.seek(upload.offset)) upload.file.close();
+    if ((uint32_t)u.have < u.offset) return uploadFail(u, 409, "out of step with the card");
+    u.file = SD.open(u.part, "r+");
+    if (u.file && !u.file.seek(u.offset)) u.file.close();
   }
-  if (!upload.file) return uploadFail(500, "cannot write " + upload.part);
-  upload.file.setBufferSize(16384);  // fewer, larger card writes
+  if (!u.file) return uploadFail(u, 500, "cannot write " + u.part);
+  u.file.setBufferSize(16384);  // fewer, larger card writes
 }
 
-void uploadFinish() {
-  upload.file.close();
-  if (!server.hasArg("total")) upload.total = upload.offset + upload.received;  // whole file in one go
-  if (upload.offset + upload.received < upload.total) return;  // more chunks to come
-
-  player::release(upload.target);
-  if (SD.exists(upload.target)) SD.remove(upload.target);
-  if (!SD.rename(upload.part, upload.target)) uploadFail(500, "could not rename " + upload.part);
+void uploadWrite(Upload &u, const uint8_t *data, size_t len) {
+  if (!u.file) return;
+  if (u.file.write(data, len) != len) return uploadFail(u, 500, "write failed (card full?)");
+  u.received += len;
 }
+
+void uploadFinish(Upload &u) {
+  u.file.close();
+  if (u.offset + u.received < u.total) return;  // more chunks to come
+
+  player::release(u.target);
+  if (SD.exists(u.target)) SD.remove(u.target);
+  if (!SD.rename(u.part, u.target)) uploadFail(u, 500, "could not rename " + u.part);
+}
+
+// Fills in the reply to a chunk and returns its status code.
+int uploadReply(const Upload &u, JsonDocument &doc) {
+  if (u.error.length()) {
+    doc["error"] = u.error;
+    if (u.have >= 0) doc["size"] = u.have;
+    return u.code;
+  }
+  if (u.offset + u.received >= u.total) filesChanged();
+  doc["ok"] = true;
+  return 200;
+}
+
+Upload formUpload;
 
 void handleUploadData() {
   HTTPUpload &up = server.upload();
   switch (up.status) {
-    case UPLOAD_FILE_START:
-      uploadStart();
+    case UPLOAD_FILE_START: {
+      // Without `total`, the request size is a close enough upper bound for the space check.
+      uint32_t offset = strtoul(server.arg("offset").c_str(), nullptr, 10);
+      uint32_t total = server.hasArg("total") ? strtoul(server.arg("total").c_str(), nullptr, 10)
+                                              : offset + server.clientContentLength();
+      uploadStart(formUpload, server.arg("path"), up.filename, offset, total);
       break;
+    }
     case UPLOAD_FILE_WRITE:
-      if (!upload.file) break;
-      if (upload.file.write(up.buf, up.currentSize) != up.currentSize) {
-        uploadFail(500, "write failed (card full?)");
-        break;
-      }
-      upload.received += up.currentSize;
+      uploadWrite(formUpload, up.buf, up.currentSize);
       break;
     case UPLOAD_FILE_END:
-      if (upload.file) uploadFinish();
+      if (!formUpload.file) break;
+      if (!server.hasArg("total")) formUpload.total = formUpload.offset + formUpload.received;  // whole file in one go
+      uploadFinish(formUpload);
       break;
     case UPLOAD_FILE_ABORTED:
       // No reply reaches the page; it retries this chunk, and the .part file stays for that.
-      uploadFail(500, "upload interrupted");
+      uploadFail(formUpload, 500, "upload interrupted");
       break;
   }
 }
 
 void handleUploadDone() {
-  if (upload.error.length()) {
-    StaticJsonDocument<256> doc;
-    doc["error"] = upload.error;
-    if (upload.have >= 0) doc["size"] = upload.have;
-    return sendJson(upload.code, doc);
+  StaticJsonDocument<256> doc;
+  int code = uploadReply(formUpload, doc);
+  sendJson(code, doc);
+}
+
+// ---- Fast upload server ----
+//
+// WebServer reads a multipart upload one byte at a time and sleeps 2 ms whenever its small
+// receive buffer runs dry, which held uploads to about 40 KB/s. This small server on
+// UPLOAD_PORT takes each chunk as a plain request body instead, and reads the socket in large
+// blocks straight onto the card. POST /upload with the query parameters above, plus `name`.
+// It is another port, so another origin to the browser: replies carry CORS headers.
+
+const size_t FAST_BUF = 16384;
+
+String percentDecode(const String &s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    if (s[i] == '%' && i + 2 < s.length()) {
+      out += (char)strtol(s.substring(i + 1, i + 3).c_str(), nullptr, 16);
+      i += 2;
+    } else {
+      out += s[i] == '+' ? ' ' : s[i];
+    }
   }
-  if (upload.offset + upload.received >= upload.total) filesChanged();
-  sendOk();
+  return out;
+}
+
+String queryArg(const String &query, const String &key) {
+  for (int start = 0; start < (int)query.length();) {
+    int end = query.indexOf('&', start);
+    if (end < 0) end = query.length();
+    int eq = query.indexOf('=', start);
+    if (eq > start && eq < end && query.substring(start, eq) == key) {
+      return percentDecode(query.substring(eq + 1, end));
+    }
+    start = end + 1;
+  }
+  return "";
+}
+
+void fastSend(int fd, int code, const String &body) {
+  String out = "HTTP/1.1 " + String(code) + (code < 300 ? " OK" : " Error") +
+               "\r\nAccess-Control-Allow-Origin: *"
+               "\r\nAccess-Control-Allow-Methods: POST"
+               "\r\nAccess-Control-Allow-Headers: Content-Type"
+               "\r\nAccess-Control-Allow-Private-Network: true"
+               "\r\nAccess-Control-Max-Age: 86400"
+               "\r\nContent-Type: application/json"
+               "\r\nContent-Length: " + String(body.length()) +
+               "\r\nConnection: close\r\n\r\n" + body;
+  for (size_t sent = 0; sent < out.length();) {
+    int n = send(fd, out.c_str() + sent, out.length() - sent, 0);
+    if (n <= 0) return;
+    sent += n;
+  }
+}
+
+void fastServe(int fd, uint8_t *buf) {
+  // The headers, which may arrive together with the start of the body.
+  size_t have = 0, headEnd = 0;
+  while (!headEnd) {
+    if (have == FAST_BUF) return;
+    int n = recv(fd, buf + have, FAST_BUF - have, 0);
+    if (n <= 0) return;
+    for (size_t i = have < 3 ? 3 : have; i < have + n && !headEnd; i++) {
+      if (!memcmp(buf + i - 3, "\r\n\r\n", 4)) headEnd = i + 1;
+    }
+    have += n;
+  }
+  uint8_t keep = buf[headEnd];
+  buf[headEnd] = 0;  // buf has a spare byte past FAST_BUF for this
+  String head = (const char *)buf;
+  buf[headEnd] = keep;
+
+  int sp1 = head.indexOf(' '), sp2 = head.indexOf(' ', sp1 + 1);
+  String method = head.substring(0, sp1), target = head.substring(sp1 + 1, sp2);
+  head.toLowerCase();
+  int cl = head.indexOf("\ncontent-length:");
+  uint32_t length = cl >= 0 ? strtoul(head.c_str() + cl + 16, nullptr, 10) : 0;
+
+  if (method == "OPTIONS") return fastSend(fd, 204, "");  // the browser's CORS preflight
+  int q = target.indexOf('?');
+  if (method != "POST" || target.substring(0, q) != "/upload") return fastSend(fd, 404, "{\"error\":\"not found\"}");
+  String query = q >= 0 ? target.substring(q + 1) : "";
+
+  Upload u;
+  uint32_t offset = strtoul(queryArg(query, "offset").c_str(), nullptr, 10);
+  String total = queryArg(query, "total");
+  uploadStart(u, queryArg(query, "path"), queryArg(query, "name"), offset,
+              total.length() ? strtoul(total.c_str(), nullptr, 10) : offset + length);
+
+  // The whole body is read even after an error, so the browser gets the reply rather than a
+  // reset connection.
+  size_t first = min((size_t)length, have - headEnd);
+  uploadWrite(u, buf + headEnd, first);
+  for (uint32_t left = length - first; left;) {
+    int n = recv(fd, buf, min((size_t)left, FAST_BUF), 0);
+    if (n <= 0) return uploadFail(u, 500, "upload interrupted");  // the page retries the chunk
+    uploadWrite(u, buf, n);
+    left -= n;
+  }
+  if (u.file) uploadFinish(u);
+
+  StaticJsonDocument<256> doc;
+  int code = uploadReply(u, doc);
+  String body;
+  serializeJson(doc, body);
+  fastSend(fd, code, body);
+}
+
+void fastTask(void *) {
+  uint8_t *buf = (uint8_t *)malloc(FAST_BUF + 1);
+  int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  int one = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(UPLOAD_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (!buf || srv < 0 || bind(srv, (sockaddr *)&addr, sizeof(addr)) || listen(srv, 2)) {
+    Serial.println("[web] could not start the upload server");
+    vTaskDelete(nullptr);
+  }
+  for (;;) {
+    int fd = accept(srv, nullptr, nullptr);
+    if (fd < 0) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    timeval tv = {10, 0};  // Wi-Fi hiccups longer than this cost a retried chunk
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    fastServe(fd, buf);
+    close(fd);
+  }
 }
 
 void handleDownload() {
@@ -732,6 +883,8 @@ void begin() {
   // without blocking, which at any higher priority starves IDLE0 and trips the task watchdog.
   // At equal priority FreeRTOS time-slices the two, so the watchdog keeps getting fed.
   xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, tskIDLE_PRIORITY, nullptr, 0);
+  // The upload server blocks on its socket rather than polling, so it can sit above idle.
+  xTaskCreatePinnedToCore(fastTask, "upload", 8192, nullptr, 1, nullptr, 0);
 }
 
 String label() {
